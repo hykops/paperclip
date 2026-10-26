@@ -1,0 +1,29 @@
+{
+  "name": "paperclip-cloudflare-edge",
+  "private": true,
+  "type": "module",
+  "description": "Alchemy stack for the Cloudflare edge in front of a self-hosted Paperclip: Tunnel, DNS, gateway Worker with KV, optional R2.",
+  "scripts": {
+    "alchemy": "alchemy",
+    "deploy": "alchemy deploy alchemy.run.ts --env-file .env --stage \"${ALCHEMY_STAGE:-prod}\"",
+    "plan": "alchemy plan alchemy.run.ts --env-file .env --stage \"${ALCHEMY_STAGE:-prod}\"",
+    "destroy": "alchemy destroy alchemy.run.ts --env-file .env --stage \"${ALCHEMY_STAGE:-prod}\"",
+    "logs": "alchemy logs --tail --env-file .env --stage \"${ALCHEMY_STAGE:-prod}\"",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "tunnel-token": "sh scripts/tunnel-token.sh"
+  },
+  "devDependencies": {
+    "@alchemy.run/cloudflare": "2.0.0-beta.84",
+    "@cloudflare/workers-types": "^5.20261024.1",
+    "@effect/platform-node": "^4.0.6",
+    "@types/node": "^24.0.0",
+    "alchemy": "2.0.0-beta.84",
+    "effect": "^4.0.6",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.8"
+  },
+  "engines": {
+    "node": ">=24.11.1"
+  }
+}

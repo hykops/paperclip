@@ -1,0 +1,131 @@
+# Paperclip on your own machine (Hostinger VPS or any Docker host), published
+# only through a Cloudflare Tunnel. No port is opened on the host.
+#
+#   /docker/paperclip/docker-compose.yml  ← this file (synced by the deploy workflow)
+#   /docker/paperclip/.env                ← secrets, from deploy/hostinger/.env.example
+#
+# Database: a hosted PostgreSQL (PlanetScale, Neon, Supabase, ...) reached through
+# DATABASE_URL. No database runs on this host.
+#
+# Cloudflare resources (tunnel, DNS, gateway Worker, KV) are provisioned by
+# deploy/cloudflare (Alchemy); see deploy/cloudflare/README.md.
+#
+# First admin: the deployment is internet-facing (PAPERCLIP_DEPLOYMENT_EXPOSURE=public),
+# so the browser "claim this instance" button is off. Mint a one-time first-admin
+# invite with deploy/hostinger/bootstrap-admin.sh after the first start.
+
+# Docker's json-file driver never rotates unless told to. Cap every container at
+# 5 x 50 MB so request and agent logs cannot fill the VPS disk.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+services:
+  paperclip:
+    image: ghcr.io/paperclipai/paperclip:${PAPERCLIP_IMAGE_TAG:-latest}
+    container_name: paperclip
+    restart: unless-stopped
+    logging: *default-logging
+    # The image makes tini PID 1 itself (Dockerfile ENTRYPOINT), so no `init:`
+    # here. pids_limit is the backstop against leaked agent processes.
+    pids_limit: 2048
+    # Covers the shared 30s adapter-settlement window and final cleanup.
+    stop_grace_period: 90s
+    # No `ports:` on purpose — only cloudflared (same compose network) reaches it.
+    expose:
+      - "3100"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "3100"
+      SERVE_UI: "true"
+      PAPERCLIP_HOME: "/paperclip"
+      # Hosted PostgreSQL. Paperclip creates its tables in the `public` schema of
+      # the database named in the URL; it cannot use another schema. Prefer the
+      # provider's direct (non-pooled) port: the pool below is long-lived and
+      # Paperclip relies on transaction semantics a transaction-mode pooler
+      # does not preserve.
+      DATABASE_URL: "${DATABASE_URL:?DATABASE_URL must be set (see .env.example)}"
+      # Migrations run on boot; the container has no TTY to ask.
+      PAPERCLIP_MIGRATION_AUTO_APPLY: "true"
+
+      # ── Internet-facing authenticated deployment behind Cloudflare ──
+      PAPERCLIP_DEPLOYMENT_MODE: "authenticated"
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: "public"
+      PAPERCLIP_PUBLIC_URL: "https://${PAPERCLIP_HOSTNAME:?PAPERCLIP_HOSTNAME must be set}"
+      PAPERCLIP_ALLOWED_HOSTNAMES: "${PAPERCLIP_HOSTNAME}"
+      # cloudflared is the only peer on this network; trust its X-Forwarded-* headers.
+      # `uniquelocal` covers Docker's default bridge subnets (172.16.0.0/12 etc.).
+      TRUST_PROXY: "uniquelocal"
+      # Cloudflare terminates TLS for every client request. The Claude setup-token
+      # login (board-driven `claude setup-token`) refuses to hand out its one-time
+      # login URL over plain HTTP unless the operator declares edge TLS termination;
+      # TRUST_PROXY deliberately does not satisfy that guard.
+      CLAUDE_LOGIN_EDGE_TLS_TERMINATED: "true"
+      # Paperclip's own account system is the only login, so the sign-up form is
+      # reachable from the internet. Leave this false while anyone still has to
+      # create an account: invitees create theirs through the same sign-up endpoint
+      # and this flag disables it for everyone (the invite-accept step only links an
+      # existing user). Set it to true as soon as every intended user has an account,
+      # and back to false (then true again) when inviting someone new.
+      PAPERCLIP_AUTH_DISABLE_SIGN_UP: "${PAPERCLIP_AUTH_DISABLE_SIGN_UP:-false}"
+
+      # ── Secrets (generate once with `openssl rand -hex 32`, never rotate casually) ──
+      BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET must be set}"
+      PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: "${PAPERCLIP_TOOL_ACTION_SIGNING_SECRET:?PAPERCLIP_TOOL_ACTION_SIGNING_SECRET must be set}"
+
+      # ── LLM provider keys for local adapters (optional; agents can also use company secrets) ──
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+
+      # ── Uploads: local volume (default) or Cloudflare R2 via the S3 provider ──
+      PAPERCLIP_STORAGE_PROVIDER: "${PAPERCLIP_STORAGE_PROVIDER:-local_disk}"
+      PAPERCLIP_STORAGE_S3_BUCKET: "${PAPERCLIP_STORAGE_S3_BUCKET:-}"
+      PAPERCLIP_STORAGE_S3_REGION: "${PAPERCLIP_STORAGE_S3_REGION:-auto}"
+      PAPERCLIP_STORAGE_S3_ENDPOINT: "${PAPERCLIP_STORAGE_S3_ENDPOINT:-}"
+      PAPERCLIP_STORAGE_S3_FORCE_PATH_STYLE: "${PAPERCLIP_STORAGE_S3_FORCE_PATH_STYLE:-true}"
+      AWS_ACCESS_KEY_ID: "${R2_ACCESS_KEY_ID:-}"
+      AWS_SECRET_ACCESS_KEY: "${R2_SECRET_ACCESS_KEY:-}"
+      # The S3 provider keeps the secrets master key off the volume only when this is set.
+      PAPERCLIP_SECRETS_MASTER_KEY: "${PAPERCLIP_SECRETS_MASTER_KEY:-}"
+      AWS_REQUEST_CHECKSUM_CALCULATION: WHEN_REQUIRED
+      AWS_RESPONSE_CHECKSUM_VALIDATION: WHEN_REQUIRED
+    volumes:
+      # Agent workspaces, uploads (local_disk), secrets key, database backups.
+      - paperclip-data:/paperclip
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:3100/api/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  cloudflared:
+    # Pin and bump deliberately; cloudflared releases monthly.
+    image: cloudflare/cloudflared:2026.10.3
+    container_name: paperclip-cloudflared
+    restart: unless-stopped
+    logging: *default-logging
+    # --metrics pins the /ready endpoint for the healthcheck on loopback (the
+    # in-container default would bind 0.0.0.0:20241-20245).
+    command: tunnel --no-autoupdate --metrics 127.0.0.1:2000 run
+    environment:
+      # The Alchemy deploy (`pnpm --dir deploy/cloudflare run deploy`) shows this output as <redacted>.
+      # Print it with `pnpm --dir deploy/cloudflare tunnel-token` (needs CLOUDFLARE_API_TOKEN +
+      # CLOUDFLARE_ACCOUNT_ID) or copy it from Zero Trust → Networks → Tunnels in the dashboard.
+      TUNNEL_TOKEN: "${TUNNEL_TOKEN:?TUNNEL_TOKEN must be set}"
+    depends_on:
+      paperclip:
+        condition: service_started
+    healthcheck:
+      # Distroless image (no shell): CMD form only. /ready is 200 only while at
+      # least one connection to the Cloudflare edge is registered, 503 otherwise.
+      test: ["CMD", "cloudflared", "tunnel", "--metrics", "127.0.0.1:2000", "ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  paperclip-data:

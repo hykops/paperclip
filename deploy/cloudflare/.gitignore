@@ -1,0 +1,5 @@
+# Alchemy's local cache (logs, version check); state lives in the Cloudflare account.
+.alchemy/
+# Stack inputs for this machine; CI writes its own copy from repository variables.
+.env
+node_modules/

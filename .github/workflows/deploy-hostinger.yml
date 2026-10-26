@@ -1,0 +1,271 @@
+name: Deploy to Cloudflare and Hostinger VPS
+
+# Self-hosted Paperclip behind a Cloudflare Tunnel. Manual only: pick the
+# published image tag to roll out (or roll back to).
+#
+# Two jobs, in order:
+#   cloudflare  `alchemy deploy` of deploy/cloudflare (tunnel, DNS, gateway
+#               Worker, KV). Idempotent: a no-op when nothing changed. Untick
+#               the "cloudflare" input to skip it, e.g. for a pure image rollback.
+#   vps         sync deploy/hostinger to the host and restart the containers.
+#
+# Secrets (repository, or on the `hostinger` environment):
+#   CLOUDFLARE_API_TOKEN  — API token with the permissions listed in deploy/cloudflare/README.md
+#   VPS_HOST, VPS_USER, VPS_SSH_KEY (private key) or VPS_SSH_PASSWORD
+# Variables:
+#   CLOUDFLARE_ACCOUNT_ID — account the stack deploys into (a secret of that name also works)
+#   PAPERCLIP_HOSTNAME    — public hostname, same value as in the VPS .env
+#   CLOUDFLARE_ZONE, PAPERCLIP_R2_ASSETS, PAPERCLIP_R2_BUCKET — optional, see deploy/cloudflare/.env.example
+#   ALCHEMY_STAGE         — optional, default prod (the VPS tunnel token belongs to one stage)
+#   VPS_APP_DIR           — optional compose directory on the host, default /docker/paperclip
+# Optional .env settings for the host, written into <VPS_APP_DIR>/.env on every deploy
+# when defined (see the SSH step's env block): secrets DATABASE_URL, BETTER_AUTH_SECRET,
+# PAPERCLIP_TOOL_ACTION_SIGNING_SECRET, PAPERCLIP_SECRETS_MASTER_KEY, R2_ACCESS_KEY_ID,
+# R2_SECRET_ACCESS_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY; variables
+# PAPERCLIP_HOSTNAME, PAPERCLIP_AUTH_DISABLE_SIGN_UP, PAPERCLIP_STORAGE_PROVIDER,
+# PAPERCLIP_STORAGE_S3_BUCKET, PAPERCLIP_STORAGE_S3_ENDPOINT. TUNNEL_TOKEN is read from
+# the Cloudflare API (tunnel paperclip-<stage>) with CLOUDFLARE_API_TOKEN; a TUNNEL_TOKEN
+# secret overrides that. Settings you do not define in GitHub are left as edited on the host.
+#
+# Rolling back: re-run with the previous tag. Migrations apply forward only, so
+# after a release that migrated the schema restore the database from your
+# provider's backup taken before that release, then start the older image.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Image tag to deploy (ghcr.io/paperclipai/paperclip:<tag>): latest, a release
+          version such as 2026.916.1 (the git tag without its leading "v"), or sha-<commit>.
+        required: true
+        default: latest
+        type: string
+      cloudflare:
+        description: Deploy the Cloudflare edge stack (deploy/cloudflare) first
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: deploy-hostinger
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  cloudflare:
+    name: Deploy Cloudflare edge
+    if: ${{ inputs.cloudflare }}
+    runs-on: ubuntu-latest
+    environment:
+      name: hostinger
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: deploy/cloudflare
+    env:
+      ALCHEMY_STAGE: ${{ vars.ALCHEMY_STAGE || 'prod' }}
+      # The CLI otherwise reports usage traces to Alchemy's collector from CI.
+      ALCHEMY_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Cone mode keeps the root files, so pnpm/action-setup reads the pnpm
+          # version from the repository package.json#packageManager.
+          sparse-checkout: deploy/cloudflare
+          sparse-checkout-cone-mode: true
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: deploy/cloudflare/pnpm-lock.yaml
+
+      - name: Install dependencies
+        # Standalone package with its own lockfile, outside the pnpm workspace.
+        run: pnpm install --frozen-lockfile --ignore-workspace
+
+      - name: Write .env
+        env:
+          PAPERCLIP_HOSTNAME: ${{ vars.PAPERCLIP_HOSTNAME }}
+          CLOUDFLARE_ZONE: ${{ vars.CLOUDFLARE_ZONE }}
+          PAPERCLIP_R2_ASSETS: ${{ vars.PAPERCLIP_R2_ASSETS }}
+          PAPERCLIP_R2_BUCKET: ${{ vars.PAPERCLIP_R2_BUCKET }}
+        run: |
+          [ -n "$PAPERCLIP_HOSTNAME" ] || { echo "::error::set the PAPERCLIP_HOSTNAME variable (repository or hostinger environment)"; exit 1; }
+          : > .env
+          for key in PAPERCLIP_HOSTNAME CLOUDFLARE_ZONE PAPERCLIP_R2_ASSETS PAPERCLIP_R2_BUCKET; do
+            [ -n "${!key}" ] && printf '%s=%s\n' "$key" "${!key}" >> .env
+          done
+          echo "stage $ALCHEMY_STAGE, hostname $PAPERCLIP_HOSTNAME"
+
+      - name: Deploy stage
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        # CI=true makes Alchemy read credentials from these variables only (no
+        # profile); --yes approves the plan since there is no terminal to ask.
+        run: pnpm run deploy --yes
+
+  vps:
+    name: Roll out ${{ inputs.tag }}
+    needs: cloudflare
+    # Run after a successful edge deploy, or directly when that job was skipped.
+    if: ${{ !cancelled() && (needs.cloudflare.result == 'success' || needs.cloudflare.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    environment:
+      name: hostinger
+    timeout-minutes: 30
+    env:
+      PAPERCLIP_IMAGE_TAG: ${{ inputs.tag }}
+      APP_DIR: ${{ vars.VPS_APP_DIR || '/docker/paperclip' }}
+    steps:
+      - name: Validate tag
+        run: |
+          # Docker tag grammar; also keeps shell/sed metacharacters out of the remote script.
+          case "$PAPERCLIP_IMAGE_TAG" in
+            ""|*[!A-Za-z0-9._-]*|.*|-*) echo "::error::invalid image tag '$PAPERCLIP_IMAGE_TAG'"; exit 1 ;;
+          esac
+          [ "${#PAPERCLIP_IMAGE_TAG}" -le 128 ] || { echo "::error::image tag longer than 128 characters"; exit 1; }
+
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            deploy/hostinger
+            deploy/cloudflare/scripts
+          sparse-checkout-cone-mode: true
+
+      - name: Sync compose file and helper scripts
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          password: ${{ secrets.VPS_SSH_PASSWORD }}
+          source: deploy/hostinger/docker-compose.yml,deploy/hostinger/bootstrap-admin.sh
+          target: ${{ env.APP_DIR }}
+          strip_components: 2
+          overwrite: true
+
+      - name: Resolve tunnel token
+        # cloudflared's connector token for tunnel paperclip-<stage>, read from the
+        # Cloudflare API so no copy of it has to be kept in GitHub. A TUNNEL_TOKEN
+        # secret wins when set; when neither is available the host's .env value stays.
+        env:
+          TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          ALCHEMY_STAGE: ${{ vars.ALCHEMY_STAGE || 'prod' }}
+        run: |
+          if [ -n "$TUNNEL_TOKEN" ]; then
+            echo "tunnel token: TUNNEL_TOKEN secret"
+          elif [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "tunnel token: not managed from GitHub (no TUNNEL_TOKEN secret, no Cloudflare credentials)"
+          elif TUNNEL_TOKEN=$(sh deploy/cloudflare/scripts/tunnel-token.sh); then
+            echo "tunnel token: Cloudflare API, tunnel paperclip-$ALCHEMY_STAGE"
+          else
+            echo "::warning::could not read the token of tunnel paperclip-$ALCHEMY_STAGE (see above); the host's .env value is kept"
+            TUNNEL_TOKEN=""
+          fi
+          [ -z "$TUNNEL_TOKEN" ] || echo "::add-mask::$TUNNEL_TOKEN"
+          echo "TUNNEL_TOKEN=$TUNNEL_TOKEN" >> "$GITHUB_ENV"
+
+      - name: Pull, restart and wait for health
+        uses: appleboy/ssh-action@v1
+        env:
+          # Optional: settings for <VPS_APP_DIR>/.env kept in GitHub. Only the ones
+          # you define are written; anything else stays as edited on the host.
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TUNNEL_TOKEN: ${{ env.TUNNEL_TOKEN }}
+          BETTER_AUTH_SECRET: ${{ secrets.BETTER_AUTH_SECRET }}
+          PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: ${{ secrets.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET }}
+          PAPERCLIP_SECRETS_MASTER_KEY: ${{ secrets.PAPERCLIP_SECRETS_MASTER_KEY }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PAPERCLIP_HOSTNAME: ${{ vars.PAPERCLIP_HOSTNAME }}
+          PAPERCLIP_AUTH_DISABLE_SIGN_UP: ${{ vars.PAPERCLIP_AUTH_DISABLE_SIGN_UP }}
+          PAPERCLIP_STORAGE_PROVIDER: ${{ vars.PAPERCLIP_STORAGE_PROVIDER }}
+          PAPERCLIP_STORAGE_S3_BUCKET: ${{ vars.PAPERCLIP_STORAGE_S3_BUCKET }}
+          PAPERCLIP_STORAGE_S3_ENDPOINT: ${{ vars.PAPERCLIP_STORAGE_S3_ENDPOINT }}
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          password: ${{ secrets.VPS_SSH_PASSWORD }}
+          timeout: 30s
+          command_timeout: 25m
+          envs: PAPERCLIP_IMAGE_TAG,APP_DIR,DATABASE_URL,TUNNEL_TOKEN,BETTER_AUTH_SECRET,PAPERCLIP_TOOL_ACTION_SIGNING_SECRET,PAPERCLIP_SECRETS_MASTER_KEY,R2_ACCESS_KEY_ID,R2_SECRET_ACCESS_KEY,ANTHROPIC_API_KEY,OPENAI_API_KEY,PAPERCLIP_HOSTNAME,PAPERCLIP_AUTH_DISABLE_SIGN_UP,PAPERCLIP_STORAGE_PROVIDER,PAPERCLIP_STORAGE_S3_BUCKET,PAPERCLIP_STORAGE_S3_ENDPOINT
+          script: |
+            set -euo pipefail
+            # Release images are tagged without the git tag's leading "v".
+            PAPERCLIP_IMAGE_TAG="${PAPERCLIP_IMAGE_TAG#v}"
+            case "$PAPERCLIP_IMAGE_TAG" in
+              ""|*[!A-Za-z0-9._-]*|.*|-*) echo "✗ invalid image tag: '$PAPERCLIP_IMAGE_TAG'"; exit 1 ;;
+            esac
+            cd "$APP_DIR"
+
+            # .env settings managed from GitHub: every non-empty secret/variable passed
+            # above replaces its line in .env; the rest of the file is kept. Then unset
+            # them, so compose reads .env rather than an empty exported value (an empty
+            # shell variable would still win over .env and trip the :? checks).
+            touch .env && chmod 600 .env
+            managed=""
+            for key in DATABASE_URL TUNNEL_TOKEN BETTER_AUTH_SECRET PAPERCLIP_TOOL_ACTION_SIGNING_SECRET \
+                       PAPERCLIP_SECRETS_MASTER_KEY R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY \
+                       ANTHROPIC_API_KEY OPENAI_API_KEY PAPERCLIP_HOSTNAME PAPERCLIP_AUTH_DISABLE_SIGN_UP \
+                       PAPERCLIP_STORAGE_PROVIDER PAPERCLIP_STORAGE_S3_BUCKET PAPERCLIP_STORAGE_S3_ENDPOINT; do
+              value="${!key:-}"
+              if [ -n "$value" ]; then
+                sed -i "/^$key=/d" .env
+                printf '%s=%s\n' "$key" "$value" >> .env
+                managed="$managed $key"
+              fi
+              unset "$key"
+            done
+            echo "▶ deploy $PAPERCLIP_IMAGE_TAG on $(hostname) ($APP_DIR)"
+            echo "  .env keys written from GitHub:${managed:- none}"
+
+            echo "▶ pull"
+            # The exported PAPERCLIP_IMAGE_TAG overrides .env for compose interpolation,
+            # so a bad tag fails here before anything on the host changes.
+            docker compose pull
+
+            # Persist the tag only now that the image exists locally, so later manual
+            # `docker compose up -d` runs keep the image that was actually fetched.
+            if grep -q '^PAPERCLIP_IMAGE_TAG=' .env; then
+              sed -i "s|^PAPERCLIP_IMAGE_TAG=.*|PAPERCLIP_IMAGE_TAG=$PAPERCLIP_IMAGE_TAG|" .env
+            else
+              printf '\nPAPERCLIP_IMAGE_TAG=%s\n' "$PAPERCLIP_IMAGE_TAG" >> .env
+            fi
+
+            echo "▶ restart"
+            docker compose up -d --remove-orphans
+
+            echo "▶ wait for health"
+            # A service counts as pending while it is not running, or runs with a
+            # healthcheck that is not yet healthy. Restart-looping containers show
+            # up as "restarting" with an empty Health column, so State matters too.
+            pending=""
+            for i in $(seq 1 60); do
+              pending=$(docker compose ps --format '{{.Service}} {{.State}} {{.Health}}' \
+                | awk '$2!="running" || ($3!="" && $3!="healthy") {print}')
+              [ -z "$pending" ] && break
+              sleep 5
+            done
+            if [ -n "$pending" ]; then
+              echo "✗ not healthy after 300s:"; echo "$pending"
+              for svc in $(printf '%s\n' "$pending" | awk '{print $1}'); do
+                echo "--- logs: $svc ---"; docker compose logs --tail=80 "$svc"
+              done
+              exit 1
+            fi
+            docker image prune -f >/dev/null
+            echo "✓ $PAPERCLIP_IMAGE_TAG live: $(docker compose ps --format '{{.Service}}={{.Status}}' | tr '\n' ' ')"
